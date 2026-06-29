@@ -32,6 +32,17 @@ _SAMPLE_LOG = (
     "2024-01-01T00:00:03.000Z FAILED tests/test_foo.py::test_bar\n"
 )
 
+# Log with ##[group] markers — one step succeeds, one fails
+_GROUPED_LOG = (
+    "2024-01-01T00:00:01.000Z ##[group]Checkout\n"
+    "2024-01-01T00:00:02.000Z Cloning repository...\n"
+    "2024-01-01T00:00:03.000Z ##[endgroup]\n"
+    "2024-01-01T00:00:04.000Z ##[group]Run tests\n"
+    "2024-01-01T00:00:05.000Z ##[error]2 tests failed\n"
+    "2024-01-01T00:00:06.000Z FAILED tests/test_foo.py::test_bar\n"
+    "2024-01-01T00:00:07.000Z ##[endgroup]\n"
+)
+
 
 def _patch_logs(logs: dict[int, str]):
     svc = MagicMock()
@@ -106,3 +117,58 @@ def test_unsupported_platform_raises():
     state = {**_BASE_STATE, "platform": "circleci", "pipeline_run": pipeline}
     with pytest.raises(ValueError, match="unsupported platform"):
         extract_errors(state)
+
+
+# --- step-level log splitting ---
+
+def test_step_level_error_output_used_when_group_markers_present():
+    with _patch_logs({7: _GROUPED_LOG}):
+        result = extract_errors(_BASE_STATE)
+    failed_step = result["pipeline_run"].jobs[0].steps[1]
+    assert "##[error]2 tests failed" in failed_step.error_output
+    assert "FAILED tests/test_foo.py::test_bar" in failed_step.error_output
+
+
+def test_step_logs_field_populated_when_section_found():
+    with _patch_logs({7: _GROUPED_LOG}):
+        result = extract_errors(_BASE_STATE)
+    failed_step = result["pipeline_run"].jobs[0].steps[1]
+    assert failed_step.logs is not None
+    assert "##[error]2 tests failed" in failed_step.logs
+
+
+def test_successful_step_logs_not_set():
+    with _patch_logs({7: _GROUPED_LOG}):
+        result = extract_errors(_BASE_STATE)
+    success_step = result["pipeline_run"].jobs[0].steps[0]
+    assert success_step.logs is None
+    assert success_step.error_output is None
+
+
+def test_checkout_log_not_in_run_tests_error_output():
+    with _patch_logs({7: _GROUPED_LOG}):
+        result = extract_errors(_BASE_STATE)
+    failed_step = result["pipeline_run"].jobs[0].steps[1]
+    assert "Cloning repository" not in (failed_step.error_output or "")
+
+
+def test_falls_back_to_job_log_when_step_has_no_section():
+    # Log has no group markers — step name won't match anything
+    with _patch_logs({7: _SAMPLE_LOG}):
+        result = extract_errors(_BASE_STATE)
+    failed_step = result["pipeline_run"].jobs[0].steps[1]
+    assert "##[error]2 tests failed" in failed_step.error_output
+    assert failed_step.logs is None
+
+
+def test_step_name_matching_is_case_insensitive():
+    # Step name in model: "Run tests" — group in log: "run tests"
+    log = (
+        "2024-01-01T00:00:01.000Z ##[group]run tests\n"
+        "2024-01-01T00:00:02.000Z ##[error]assertion failed\n"
+        "2024-01-01T00:00:03.000Z ##[endgroup]\n"
+    )
+    with _patch_logs({7: log}):
+        result = extract_errors(_BASE_STATE)
+    failed_step = result["pipeline_run"].jobs[0].steps[1]
+    assert "##[error]assertion failed" in failed_step.error_output

@@ -2,7 +2,7 @@ import os
 
 from app.models.pipeline import PipelineRun
 from app.services.github_service import GitHubService
-from app.services.log_parser_service import extract_error_context
+from app.services.log_parser_service import extract_error_context, split_log_by_step
 from app.workflows.state import WorkflowState
 
 
@@ -13,6 +13,14 @@ def _fetch_logs_github(pipeline_run: PipelineRun, owner: str, repo: str) -> dict
             if job.status == "failure" and job.job_id:
                 logs[job.job_id] = svc.get_job_logs(owner, repo, int(job.job_id))
     return logs
+
+
+def _find_step_log(step_name: str, step_logs: dict[str, str]) -> str | None:
+    lower = step_name.lower()
+    for name, text in step_logs.items():
+        if name.lower() == lower:
+            return text
+    return None
 
 
 def extract_errors(state: WorkflowState) -> WorkflowState:
@@ -37,13 +45,26 @@ def extract_errors(state: WorkflowState) -> WorkflowState:
             updated_jobs.append(job)
             continue
 
-        error_output = extract_error_context(log_text)
-        updated_steps = [
-            step.model_copy(update={"error_output": error_output})
-            if step.status == "failure"
-            else step
-            for step in job.steps
-        ]
+        step_logs = split_log_by_step(log_text)
+        job_error_output = extract_error_context(log_text)
+
+        updated_steps = []
+        for step in job.steps:
+            if step.status != "failure":
+                updated_steps.append(step)
+                continue
+
+            step_log = _find_step_log(step.name, step_logs)
+            if step_log is not None:
+                error_output = extract_error_context(step_log) or job_error_output
+                updated_steps.append(
+                    step.model_copy(update={"logs": step_log, "error_output": error_output})
+                )
+            else:
+                updated_steps.append(
+                    step.model_copy(update={"error_output": job_error_output})
+                )
+
         updated_jobs.append(job.model_copy(update={"steps": updated_steps}))
 
     updated_run = pipeline_run.model_copy(update={"jobs": updated_jobs})
